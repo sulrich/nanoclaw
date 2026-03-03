@@ -12,7 +12,12 @@
       "Bash(npm pack:*)",
       "Bash(git status:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(container system status 2>&1 || container system start 2>&1)",
+      "Bash(./container/build.sh:*)",
+      "Bash(launchctl unload:*)",
+      "Bash(/opt/homebrew/bin/things:*)",
+      "Bash(test:*)"
     ]
   }
 }

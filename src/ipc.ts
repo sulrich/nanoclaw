@@ -1,3 +1,4 @@
+import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -9,6 +10,7 @@ import {
   MAIN_GROUP_FOLDER,
   TIMEZONE,
 } from './config.js';
+import { readEnvFile } from './env.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
@@ -111,6 +113,42 @@ export function startIpcWatcher(deps: IpcDeps): void {
           { err, sourceGroup },
           'Error reading IPC messages directory',
         );
+      }
+
+      // Process Things CLI requests from this group's IPC directory
+      const thingsReqDir = path.join(ipcBaseDir, sourceGroup, 'things-requests');
+      try {
+        if (fs.existsSync(thingsReqDir)) {
+          const reqFiles = fs
+            .readdirSync(thingsReqDir)
+            .filter((f) => f.endsWith('.json'));
+          for (const file of reqFiles) {
+            const filePath = path.join(thingsReqDir, file);
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              fs.unlinkSync(filePath);
+              const result = executeThingsCommand(
+                data.requestId as string,
+                data.command as string,
+                (data.cliArgs as string[]) || [],
+              );
+              const resDir = path.join(ipcBaseDir, sourceGroup, 'things-responses');
+              fs.mkdirSync(resDir, { recursive: true });
+              const resPath = path.join(resDir, `${data.requestId}.json`);
+              const tmpPath = `${resPath}.tmp`;
+              fs.writeFileSync(tmpPath, JSON.stringify(result));
+              fs.renameSync(tmpPath, resPath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing Things request',
+              );
+              try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+            }
+          }
+        }
+      } catch (err) {
+        logger.error({ err, sourceGroup }, 'Error reading Things request directory');
       }
 
       // Process tasks from this group's IPC directory
@@ -384,4 +422,45 @@ export async function processTaskIpc(
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
+}
+
+// --- Things 3 CLI integration ---
+
+const THINGS_BIN = process.env.THINGS_BIN || '/opt/homebrew/bin/things';
+
+function executeThingsCommand(
+  requestId: string,
+  command: string,
+  cliArgs: string[],
+): { result?: string; error?: string } {
+  if (!command) {
+    return { error: 'Missing command in Things request' };
+  }
+
+  const envConfig = readEnvFile(['THINGS_AUTH_TOKEN']);
+  const token =
+    process.env.THINGS_AUTH_TOKEN || envConfig.THINGS_AUTH_TOKEN || '';
+
+  logger.debug({ requestId, command, cliArgs }, 'Running Things CLI');
+
+  const result = spawnSync(THINGS_BIN, [command, ...cliArgs], {
+    encoding: 'utf-8',
+    env: token ? { ...process.env, THINGS_AUTH_TOKEN: token } : { ...process.env },
+    timeout: 10000,
+  });
+
+  const stdout = result.stdout || '';
+  const stderr = result.stderr || '';
+  const exitCode = result.status ?? -1;
+
+  if (exitCode !== 0) {
+    logger.warn(
+      { requestId, command, exitCode, stderr },
+      'Things CLI returned non-zero exit code',
+    );
+    return { error: stderr || `Exit code ${exitCode}` };
+  }
+
+  logger.info({ requestId, command }, 'Things CLI completed');
+  return { result: stdout };
 }
