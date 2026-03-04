@@ -4,15 +4,10 @@ import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import {
-  DATA_DIR,
-  IPC_POLL_INTERVAL,
-  MAIN_GROUP_FOLDER,
-  TIMEZONE,
-} from './config.js';
+import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { readEnvFile } from './env.js';
-import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import { AvailableGroup, writeTasksSnapshot } from './container-runner.js';
+import { createTask, deleteTask, getAllTasks, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
@@ -21,7 +16,7 @@ export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
-  syncGroupMetadata: (force: boolean) => Promise<void>;
+  syncGroups: (force: boolean) => Promise<void>;
   getAvailableGroups: () => AvailableGroup[];
   writeGroupsSnapshot: (
     groupFolder: string,
@@ -59,8 +54,14 @@ export function startIpcWatcher(deps: IpcDeps): void {
 
     const registeredGroups = deps.registeredGroups();
 
+    // Build folder→isMain lookup from registered groups
+    const folderIsMain = new Map<string, boolean>();
+    for (const group of Object.values(registeredGroups)) {
+      if (group.isMain) folderIsMain.set(group.folder, true);
+    }
+
     for (const sourceGroup of groupFolders) {
-      const isMain = sourceGroup === MAIN_GROUP_FOLDER;
+      const isMain = folderIsMain.get(sourceGroup) === true;
       const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
       const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
 
@@ -190,6 +191,32 @@ export function startIpcWatcher(deps: IpcDeps): void {
   logger.info('IPC watcher started (per-group namespaces)');
 }
 
+/** Resolve a task ID, tolerating the agent stripping the "task-" prefix. */
+function resolveTaskId(taskId: string): ReturnType<typeof getTaskById> {
+  return getTaskById(taskId) ?? getTaskById(`task-${taskId}`);
+}
+
+function refreshTasksSnapshot(groupFolder: string, isMain: boolean): void {
+  try {
+    const tasks = getAllTasks();
+    writeTasksSnapshot(
+      groupFolder,
+      isMain,
+      tasks.map((t) => ({
+        id: t.id,
+        groupFolder: t.group_folder,
+        prompt: t.prompt,
+        schedule_type: t.schedule_type,
+        schedule_value: t.schedule_value,
+        status: t.status,
+        next_run: t.next_run,
+      })),
+    );
+  } catch (err) {
+    logger.error({ err, groupFolder }, 'Failed to refresh tasks snapshot');
+  }
+}
+
 export async function processTaskIpc(
   data: {
     type: string;
@@ -305,59 +332,51 @@ export async function processTaskIpc(
           { taskId, sourceGroup, targetFolder, contextMode },
           'Task created via IPC',
         );
+        refreshTasksSnapshot(sourceGroup, isMain);
       }
       break;
 
     case 'pause_task':
       if (data.taskId) {
-        const task = getTaskById(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          updateTask(data.taskId, { status: 'paused' });
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task paused via IPC',
-          );
+        const task = resolveTaskId(data.taskId);
+        if (!task) {
+          logger.warn({ taskId: data.taskId, sourceGroup }, 'Task not found for pause');
+        } else if (isMain || task.group_folder === sourceGroup) {
+          updateTask(task.id, { status: 'paused' });
+          logger.info({ taskId: task.id, sourceGroup }, 'Task paused via IPC');
+          refreshTasksSnapshot(sourceGroup, isMain);
         } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task pause attempt',
-          );
+          logger.warn({ taskId: task.id, sourceGroup }, 'Unauthorized task pause attempt');
         }
       }
       break;
 
     case 'resume_task':
       if (data.taskId) {
-        const task = getTaskById(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          updateTask(data.taskId, { status: 'active' });
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task resumed via IPC',
-          );
+        const task = resolveTaskId(data.taskId);
+        if (!task) {
+          logger.warn({ taskId: data.taskId, sourceGroup }, 'Task not found for resume');
+        } else if (isMain || task.group_folder === sourceGroup) {
+          updateTask(task.id, { status: 'active' });
+          logger.info({ taskId: task.id, sourceGroup }, 'Task resumed via IPC');
+          refreshTasksSnapshot(sourceGroup, isMain);
         } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task resume attempt',
-          );
+          logger.warn({ taskId: task.id, sourceGroup }, 'Unauthorized task resume attempt');
         }
       }
       break;
 
     case 'cancel_task':
       if (data.taskId) {
-        const task = getTaskById(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
-          deleteTask(data.taskId);
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task cancelled via IPC',
-          );
+        const task = resolveTaskId(data.taskId);
+        if (!task) {
+          logger.warn({ taskId: data.taskId, sourceGroup }, 'Task not found for cancel');
+        } else if (isMain || task.group_folder === sourceGroup) {
+          deleteTask(task.id);
+          logger.info({ taskId: task.id, sourceGroup }, 'Task cancelled via IPC');
+          refreshTasksSnapshot(sourceGroup, isMain);
         } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task cancel attempt',
-          );
+          logger.warn({ taskId: task.id, sourceGroup }, 'Unauthorized task cancel attempt');
         }
       }
       break;
@@ -369,7 +388,7 @@ export async function processTaskIpc(
           { sourceGroup },
           'Group metadata refresh requested via IPC',
         );
-        await deps.syncGroupMetadata(true);
+        await deps.syncGroups(true);
         // Write updated snapshot immediately
         const availableGroups = deps.getAvailableGroups();
         deps.writeGroupsSnapshot(
@@ -403,6 +422,7 @@ export async function processTaskIpc(
           );
           break;
         }
+        // Defense in depth: agent cannot set isMain via IPC
         deps.registerGroup(data.jid, {
           name: data.name,
           folder: data.folder,

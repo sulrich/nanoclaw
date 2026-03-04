@@ -17,7 +17,9 @@
       "Bash(./container/build.sh:*)",
       "Bash(launchctl unload:*)",
       "Bash(/opt/homebrew/bin/things:*)",
-      "Bash(test:*)"
+      "Bash(test:*)",
+      "Bash(sqlite3:*)",
+      "Bash(ls:*)"
     ]
   }
 }
